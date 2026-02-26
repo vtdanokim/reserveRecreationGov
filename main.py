@@ -65,17 +65,20 @@ def load_config(path: str = "config.yaml") -> dict:
 # Availability check helper (synchronous, for polling loop)
 # ---------------------------------------------------------------------------
 
-def check_availability(checker: AvailabilityChecker, cfg: dict) -> list[tuple[str, str]]:
+def check_availability(
+    checker: AvailabilityChecker,
+    cfg: dict,
+    eligible_sites: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
     """
     Poll the availability API once and return a list of (campsite_id, site_name)
-    tuples for every preferred site that is currently available.
+    tuples for every eligible site that is currently available.
     """
     checkin = date.fromisoformat(cfg["booking"]["checkin_date"])
     checkout = date.fromisoformat(cfg["booking"]["checkout_date"])
-    preferred = cfg["booking"].get("preferred_sites", [])
 
     checker.clear_cache()  # Always fetch fresh data in polling mode
-    return checker.find_available_sites(checkin, checkout, preferred)
+    return checker.find_available_sites(checkin, checkout, eligible_sites)
 
 
 # ---------------------------------------------------------------------------
@@ -85,18 +88,33 @@ def check_availability(checker: AvailabilityChecker, cfg: dict) -> list[tuple[st
 def run_check_only(cfg: dict):
     """Print current availability and exit — no booking attempted."""
     campground_id = cfg["recreation_gov"]["campground_id"]
-    checker = AvailabilityChecker(campground_id)
-    available = check_availability(checker, cfg)
+    filters = cfg.get("filters", {})
+    loop_filter = filters.get("loop", "")
+    min_length = filters.get("min_vehicle_length_ft", 0)
 
-    checkin = cfg["booking"]["checkin_date"]
-    checkout = cfg["booking"]["checkout_date"]
-    print(f"\nCampground {campground_id} — {checkin} to {checkout}")
+    checker = AvailabilityChecker(campground_id)
+
+    checkin_str = cfg["booking"]["checkin_date"]
+    checkout_str = cfg["booking"]["checkout_date"]
+    checkin = date.fromisoformat(checkin_str)
+
+    print(f"\nBuilding eligible site list  (loop='{loop_filter}', min_vehicle_length={min_length} ft) ...")
+    eligible = checker.build_eligible_sites(
+        loop_filter=loop_filter,
+        min_vehicle_length_ft=min_length,
+        reference_date=checkin,
+    )
+    print(f"  {len(eligible)} eligible site(s): {[name for _, name in eligible]}\n")
+
+    available = check_availability(checker, cfg, eligible)
+
+    print(f"Campground {campground_id} — {checkin_str} to {checkout_str}")
     if available:
         print(f"  {len(available)} available site(s):")
         for campsite_id, site_name in available:
             print(f"    Site {site_name:>4}  (internal ID: {campsite_id})")
     else:
-        print("  No preferred sites are currently available.")
+        print("  No eligible sites are currently available for those dates.")
     print()
 
 
@@ -118,6 +136,9 @@ async def run_booking(cfg: dict, dry_run: bool = False):
     campground_id = cfg["recreation_gov"]["campground_id"]
     checkin  = date.fromisoformat(cfg["booking"]["checkin_date"])
     checkout = date.fromisoformat(cfg["booking"]["checkout_date"])
+    filters  = cfg.get("filters", {})
+    loop_filter  = filters.get("loop", "")
+    min_length   = filters.get("min_vehicle_length_ft", 0)
 
     # -----------------------------------------------------------------------
     # Step 1: NTP sync
@@ -137,14 +158,40 @@ async def run_booking(cfg: dict, dry_run: bool = False):
         release_utc.strftime("%Y-%m-%d %H:%M:%S"),
     )
     logger.info("Booking target: %s to %s", checkin, checkout)
-    logger.info("Preferred sites: %s", cfg["booking"].get("preferred_sites", []))
+    logger.info("Filters: loop='%s', min_vehicle_length=%d ft", loop_filter, min_length)
     logger.info(timer.status_line())
 
     # -----------------------------------------------------------------------
-    # Step 2: Wait for pre-flight window, then launch browser
+    # Step 2: Wait for pre-flight window, then launch browser + fetch site list
     # -----------------------------------------------------------------------
     timer.wait_until_preflight(preflight_secs)
-    logger.info("Pre-flight window reached — launching browser ...")
+    logger.info("Pre-flight window reached — launching browser and fetching eligible sites ...")
+
+    checker = AvailabilityChecker(campground_id)
+
+    if not dry_run:
+        eligible_sites = checker.build_eligible_sites(
+            loop_filter=loop_filter,
+            min_vehicle_length_ft=min_length,
+            reference_date=checkin,
+        )
+    else:
+        logger.info("[DRY RUN] Skipping attribute fetch — using all sites.")
+        eligible_sites = None  # find_available_sites will consider everything
+
+    if eligible_sites is not None and len(eligible_sites) == 0:
+        logger.error(
+            "No sites match loop='%s' and min_vehicle_length=%d ft. "
+            "Check your filters and run --check-only to debug.",
+            loop_filter,
+            min_length,
+        )
+        return
+
+    logger.info(
+        "Eligible sites: %s",
+        [name for _, name in eligible_sites] if eligible_sites else "all",
+    )
 
     async with Booker(cfg) as booker:
         if not dry_run:
@@ -166,12 +213,11 @@ async def run_booking(cfg: dict, dry_run: bool = False):
             poll_timeout,
         )
 
-        checker = AvailabilityChecker(campground_id)
         booked = False
         poll_start = time.monotonic()
 
         while (time.monotonic() - poll_start) < poll_timeout:
-            available = check_availability(checker, cfg)
+            available = check_availability(checker, cfg, eligible_sites)
 
             if available:
                 campsite_id, site_name = available[0]
@@ -197,10 +243,12 @@ async def run_booking(cfg: dict, dry_run: bool = False):
                         "Booking attempt for site %s failed — trying next available ...",
                         site_name,
                     )
-                    # Remove the failed site from the preferred list and retry
-                    preferred = cfg["booking"].get("preferred_sites", [])
-                    if site_name in preferred:
-                        preferred.remove(site_name)
+                    # Remove the failed site from the eligible list and retry
+                    if eligible_sites is not None:
+                        eligible_sites = [
+                            (cid, name) for cid, name in eligible_sites
+                            if name != site_name
+                        ]
 
             else:
                 logger.debug("No available sites yet — polling again ...")
